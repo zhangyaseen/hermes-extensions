@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
 Apply custom feishu.py patches after hermes update.
-This script adds pipeline routing functionality (a-stock-message-analyzer).
+
+HISTORY:
+  This script originally patched gateway/platforms/feishu.py to add pipeline routing.
+  Since Hermes migrated feishu to a plugin (plugins/platforms/feishu/), and the
+  pipeline-routing plugin (pre_gateway_dispatch hook) now handles all message routing,
+  this patch is OBSOLETE for the plugin-based architecture.
+
+  The script is kept for backward compatibility with older Hermes versions that still
+  have gateway/platforms/feishu.py. If neither location exists, it exits successfully
+  (the plugin handles routing).
+
 NOTE: require_mention is now handled via config.yaml (FEISHU_REQUIRE_MENTION=false).
 """
 
@@ -9,7 +19,9 @@ import sys
 from pathlib import Path
 
 HERMES_DIR = Path.home() / ".hermes" / "hermes-agent"
+# Try old location first, then new plugin location
 FEISHU_PY = HERMES_DIR / "gateway" / "platforms" / "feishu.py"
+FEISHU_ADAPTER_PY = HERMES_DIR / "plugins" / "platforms" / "feishu" / "adapter.py"
 LOG_FILE = "/tmp/hermes-custom-patch.log"
 
 def log(msg):
@@ -18,12 +30,27 @@ def log(msg):
         f.write(f"[{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 def patch_feishu():
-    """Apply pipeline routing modifications to feishu.py"""
-    if not FEISHU_PY.exists():
-        log(f"ERROR: {FEISHU_PY} not found")
-        return False
+    """Apply pipeline routing modifications to feishu.py (legacy path only).
+
+    NOTE: For Hermes >= 2026-07, feishu is a plugin and routing is handled by
+    the pipeline-routing plugin (pre_gateway_dispatch hook). This function
+    only patches the old gateway/platforms/feishu.py if it exists.
+    """
+    # Determine which file to patch
+    if FEISHU_PY.exists():
+        target_path = FEISHU_PY
+        log(f"PATCH: Found legacy feishu.py at {target_path}")
+    elif FEISHU_ADAPTER_PY.exists():
+        # Feishu has been migrated to a plugin - the pipeline-routing plugin
+        # handles routing via pre_gateway_dispatch hook, so no patch needed.
+        log("SKIP: Feishu is now a plugin; pipeline-routing plugin handles routing")
+        return True
+    else:
+        log("WARNING: Neither feishu.py nor feishu/adapter.py found")
+        log("         Pipeline routing is handled by the pipeline-routing plugin")
+        return True
     
-    content = FEISHU_PY.read_text()
+    content = target_path.read_text()
     
     # Check if already patched
     if "def _should_route_to_pipeline" in content and "def _route_to_pipeline" in content:
@@ -207,7 +234,7 @@ def patch_feishu():
     
     # Write the modified content
     if content != original:
-        FEISHU_PY.write_text(content)
+        target_path.write_text(content)
         log("SUCCESS: feishu.py pipeline routing patched successfully")
         return True
     else:
