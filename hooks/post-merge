@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Post-merge git hook: automatically apply custom patches after hermes update
+# This hook is installed at .git/hooks/post-merge
+
+PATCH_SCRIPT="${HOME}/.hermes/scripts/apply-custom-patches.py"
+FEISHU_PATCH_SCRIPT="${HOME}/.hermes/scripts/patch-feishu.py"
+LOG_FILE="/tmp/hermes-post-merge.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    echo "$1"
+}
+
+log "=========================================="
+log "Post-merge hook triggered"
+log "=========================================="
+
+# Apply auxiliary_client.py and config.py patches
+if [ -f "$PATCH_SCRIPT" ]; then
+    log "Running apply-custom-patches.py..."
+    python3 "$PATCH_SCRIPT" >> "$LOG_FILE" 2>&1
+    if [ $? -eq 0 ]; then
+        log "SUCCESS: Basic patches applied"
+    else
+        log "WARNING: Some basic patches failed, check log"
+    fi
+else
+    log "SKIP: $PATCH_SCRIPT not found"
+fi
+
+# Apply feishu.py patches
+if [ -f "$FEISHU_PATCH_SCRIPT" ]; then
+    log "Running patch-feishu.py..."
+    python3 "$FEISHU_PATCH_SCRIPT" >> "$LOG_FILE" 2>&1
+    if [ $? -eq 0 ]; then
+        log "SUCCESS: feishu.py patches applied"
+    else
+        log "ERROR: feishu.py patches failed, manual intervention required"
+    fi
+else
+    log "SKIP: $FEISHU_PATCH_SCRIPT not found"
+fi
+
+log "Post-merge hook completed"
+log "=========================================="

@@ -1,0 +1,227 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 6826476fd..8a1e2e625 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -242,6 +242,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
+ _PROVIDER_VISION_MODELS: Dict[str, str] = {
+     "xiaomi": "mimo-v2.5",
+     "zai": "glm-5v-turbo",
++    "alibaba": "qwen3.6-plus",
+ }
+ 
+ # Providers whose endpoint does not accept image input, even though the
+diff --git a/gateway/config.py b/gateway/config.py
+index 7d4d259ca..53e7b524a 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -1278,6 +1278,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
+         feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+         if feishu_verification_token:
+             config.platforms[Platform.FEISHU].extra["verification_token"] = feishu_verification_token
++        feishu_allow_all_group = os.getenv("FEISHU_ALLOW_ALL_GROUP_MESSAGES", "").strip().lower()
++        if feishu_allow_all_group in {"true", "1", "yes"}:
++            config.platforms[Platform.FEISHU].extra["allow_all_group_messages"] = True
+         feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
+         if feishu_home:
+             config.platforms[Platform.FEISHU].home_channel = HomeChannel(
+diff --git a/gateway/platforms/feishu.py b/gateway/platforms/feishu.py
+index 718f01e99..1e871b855 100644
+--- a/gateway/platforms/feishu.py
++++ b/gateway/platforms/feishu.py
+@@ -4,6 +4,8 @@ Feishu/Lark platform adapter.
+ Supports:
+ - WebSocket long connection and Webhook transport
+ - Direct-message and group @mention-gated text receive/send
++- Optional: accept all group messages without @mention gate
++    (via FEISHU_ALLOW_ALL_GROUP_MESSAGES=true)
+ - Inbound image/file/audio/media caching
+ - Gateway allowlist integration via FEISHU_ALLOWED_USERS
+ - Persistent dedup state across restarts
+@@ -56,6 +58,7 @@ import logging
+ import mimetypes
+ import os
+ import re
++import sys
+ import threading
+ import time
+ import uuid
+@@ -387,6 +390,7 @@ class FeishuAdapterSettings:
+     admins: frozenset[str] = frozenset()
+     default_group_policy: str = ""
+     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
++    allow_all_group_messages: bool = False
+ 
+ 
+ @dataclass
+@@ -396,6 +400,7 @@ class FeishuGroupRule:
+     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
+     allowlist: set[str] = field(default_factory=set)
+     blacklist: set[str] = field(default_factory=set)
++    pipeline: bool = False  # If True, route message to pipeline instead of Agent
+ 
+ 
+ @dataclass
+@@ -1381,6 +1386,7 @@ class FeishuAdapter(BasePlatformAdapter):
+                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
+                     allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
+                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
++                    pipeline=bool(rule_cfg.get("pipeline", False)),
+                 )
+ 
+         # Bot-level admins
+@@ -1446,6 +1452,9 @@ class FeishuAdapter(BasePlatformAdapter):
+             admins=admins,
+             default_group_policy=default_group_policy,
+             group_rules=group_rules,
++            allow_all_group_messages=str(
++                extra.get("allow_all_group_messages") or os.getenv("FEISHU_ALLOW_ALL_GROUP_MESSAGES", "")
++            ).strip().lower() in {"true", "1", "yes"},
+         )
+ 
+     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
+@@ -1476,6 +1485,7 @@ class FeishuAdapter(BasePlatformAdapter):
+         self._ws_reconnect_interval = settings.ws_reconnect_interval
+         self._ws_ping_interval = settings.ws_ping_interval
+         self._ws_ping_timeout = settings.ws_ping_timeout
++        self._allow_all_group_messages = settings.allow_all_group_messages
+ 
+     def _build_event_handler(self) -> Any:
+         if EventDispatcherHandler is None:
+@@ -2742,6 +2752,10 @@ class FeishuAdapter(BasePlatformAdapter):
+ 
+     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
+         """Apply Feishu-specific burst protection before entering the base adapter."""
++        # Pipeline routing: check if message is from a pipeline-enabled group
++        if self._should_route_to_pipeline(event):
++            await self._route_to_pipeline(event)
++            return
+         if event.message_type == MessageType.TEXT and not event.is_command():
+             await self._enqueue_text_event(event)
+             return
+@@ -2750,6 +2764,106 @@ class FeishuAdapter(BasePlatformAdapter):
+             return
+         await self._handle_message_with_guards(event)
+ 
++    # =========================================================================
++    # Pipeline routing
++    # =========================================================================
++
++    def _should_route_to_pipeline(self, event: MessageEvent) -> bool:
++        """Check if message should be routed to the a-stock pipeline instead of Agent."""
++        chat_id = event.source.chat_id
++        if not chat_id:
++            return False
++        # Check pipeline_groups.json config
++        try:
++            config_path = Path(__file__).parent.parent.parent.parent / "skills" / "a-stock-message-analyzer" / "config" / "pipeline_groups.json"
++            if config_path.exists():
++                with open(config_path) as f:
++                    cfg = json.load(f)
++                pipeline_ids = cfg.get("pipeline_group_ids", [])
++                if chat_id in pipeline_ids:
++                    return True
++        except Exception:
++            pass
++        # Fallback: check group_rules
++        rule = self._settings.group_rules.get(chat_id)
++        if rule is not None and rule.pipeline:
++            return True
++        return False
++
++    async def _route_to_pipeline(self, event: MessageEvent) -> None:
++        """Route message to a-stock pipeline: enqueue + trigger pipeline runner."""
++        import subprocess
++        import threading
++
++        chat_id = event.source.chat_id
++        message_id = event.message_id or ""
++        sender_id = event.source.user_id or ""
++        text = event.text or ""
++
++        # Determine message type
++        if event.message_type == MessageType.TEXT:
++            msg_type = "text"
++        elif event.message_type == MessageType.PHOTO:
++            msg_type = "photo"
++        elif event.message_type == MessageType.DOCUMENT:
++            msg_type = "document"
++        else:
++            msg_type = "text"
++
++        # Build media URLs from event
++        media_urls = [u for u in (event.media_urls or [])]
++        media_types = [t for t in (event.media_types or [])]
++
++        logger.info(
++            "[Feishu] Routing to pipeline: chat_id=%s message_id=%s type=%s",
++            chat_id, message_id, msg_type,
++        )
++
++        # Add typing indicator
++        try:
++            await self.send_typing(chat_id)
++        except Exception:
++            pass
++
++        def _run_pipeline():
++            """Run pipeline in a background thread to avoid blocking the gateway."""
++            try:
++                # Enqueue message
++                sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "skills" / "a-stock-message-analyzer"))
++                from scripts.feishu_enqueue import enqueue_feishu_message
++                queue_id = enqueue_feishu_message(
++                    chat_id=chat_id,
++                    message_id=message_id,
++                    sender_id=sender_id,
++                    msg_type=msg_type,
++                    content=text,
++                    media_urls=media_urls,
++                    media_types=media_types,
++                    thread_id=event.source.thread_id,
++                )
++                logger.info("[Feishu] Pipeline enqueue: queue_id=%s", queue_id)
++
++                # Run pipeline for this specific message
++                skill_dir = Path(__file__).parent.parent.parent.parent / "skills" / "a-stock-message-analyzer"
++                env = os.environ.copy()
++                if self._settings.app_id:
++                    env["FEISHU_APP_ID"] = self._settings.app_id
++                if self._settings.app_secret:
++                    env["FEISHU_APP_SECRET"] = self._settings.app_secret
++                result = subprocess.run(
++                    ["/opt/homebrew/bin/python3", "scripts/pipeline_runner.py", "--queue-id", str(queue_id)],
++                    capture_output=True, text=True, cwd=str(skill_dir), timeout=300, env=env,
++                )
++                output = result.stdout + result.stderr
++                logger.info("[Feishu] Pipeline output for queue_id=%s:\n%s", queue_id, output[:500])
++            except subprocess.TimeoutExpired:
++                logger.error("[Feishu] Pipeline timeout for queue_id")
++            except Exception as e:
++                logger.error("[Feishu] Pipeline routing error: %s", e, exc_info=True)
++
++        thread = threading.Thread(target=_run_pipeline, name="feishu-pipeline-router", daemon=True)
++        thread.start()
++
+     # =========================================================================
+     # Media batching
+     # =========================================================================
+@@ -3626,9 +3740,18 @@ class FeishuAdapter(BasePlatformAdapter):
+         return bool(sender_ids and (sender_ids & self._allowed_group_users))
+ 
+     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
+-        """Require an explicit @mention before group messages enter the agent."""
++        """Require an explicit @mention before group messages enter the agent.
++
++        When ``allow_all_group_messages`` is enabled (via
++        ``FEISHU_ALLOW_ALL_GROUP_MESSAGES=true``), the @mention requirement is
++        bypassed — all group messages pass through after the sender/identity
++        policy gate (``_allow_group_message``).
++        """
+         if not self._allow_group_message(sender_id, chat_id):
+             return False
++        # When configured to accept all group messages, skip the @mention gate.
++        if self._allow_all_group_messages:
++            return True
+         # @_all is Feishu's @everyone placeholder — always route to the bot.
+         raw_content = getattr(message, "content", "") or ""
+         if "@_all" in raw_content:
