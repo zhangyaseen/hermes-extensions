@@ -31,10 +31,12 @@ def on_pre_gateway_dispatch(event, gateway, **kwargs):
     """
     # 仅处理飞书平台
     if event.source.platform.value != "feishu":
+        logger.debug(f"[feishu-skill-binding] 跳过非飞书平台: {event.source.platform.value}")
         return None
 
     chat_id = event.source.chat_id
     thread_id = event.source.thread_id
+    logger.info(f"[feishu-skill-binding] 🔍 处理飞书消息 chat_id={chat_id} thread_id={thread_id}")
 
     # 获取飞书 adapter
     try:
@@ -45,7 +47,10 @@ def on_pre_gateway_dispatch(event, gateway, **kwargs):
         return None
 
     if not feishu_adapter:
+        logger.warning("[feishu-skill-binding] 飞书 adapter 不存在")
         return None
+
+    logger.info("[feishu-skill-binding] 🔧 开始解析 skill bindings")
 
     # 解析 skill bindings
     try:
@@ -55,15 +60,21 @@ def on_pre_gateway_dispatch(event, gateway, **kwargs):
             chat_id,
             thread_id
         )
+        logger.info(f"[feishu-skill-binding] 📋 resolve_channel_skills 返回: {skills}")
     except Exception as e:
-        logger.warning(f"[feishu-skill-binding] 解析 skill bindings 失败: {e}")
+        logger.warning(f"[feishu-skill-binding] 解析 skill bindings 失败: {e}", exc_info=True)
         return None
 
     # 如果匹配，设置 auto_skill
     if skills:
         event.auto_skill = skills
         logger.info(
-            f"[feishu-skill-binding] 注入 skills={skills} "
+            f"[feishu-skill-binding] ✅ 注入 skills={skills} "
+            f"chat_id={chat_id} thread_id={thread_id}"
+        )
+    else:
+        logger.info(
+            f"[feishu-skill-binding] ⚠️ 未找到匹配的 skill binding "
             f"chat_id={chat_id} thread_id={thread_id}"
         )
 
