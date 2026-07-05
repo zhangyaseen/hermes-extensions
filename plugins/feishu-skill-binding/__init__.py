@@ -2,7 +2,7 @@
 
 import logging
 
-logger = logging.getLogger("feishu-skill-binding")
+logger = logging.getLogger(__name__)
 
 
 def register(ctx):

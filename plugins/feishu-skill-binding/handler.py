@@ -15,7 +15,7 @@ pre_gateway_dispatch hook: 为飞书消息注入 auto_skill
 
 import logging
 
-logger = logging.getLogger("feishu-skill-binding")
+logger = logging.getLogger(__name__)
 
 
 def on_pre_gateway_dispatch(event, gateway, **kwargs):
