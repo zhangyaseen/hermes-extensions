@@ -1,0 +1,5 @@
+name: feishu-skill-binding
+version: "1.0.0"
+description: "飞书 channel skill binding — 根据群聊 ID 自动加载 skill"
+provides_hooks:
+  - pre_gateway_dispatch

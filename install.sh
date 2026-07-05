@@ -14,6 +14,9 @@ HERMES_AGENT_DIR="${HERMES_HOME}/hermes-agent"
 
 PATCH_FILES=("apply-custom-patches.py" "patch-feishu.py" "hermes-custom-patches.patch")
 
+# 新增：Plugin 目录
+PLUGIN_DIRS=("feishu-skill-binding")
+
 uninstall() {
     echo "Uninstalling hermes-extensions..."
 
@@ -23,6 +26,15 @@ uninstall() {
         if [ -L "$target" ]; then
             rm "$target"
             echo "REMOVED: ${f}"
+        fi
+    done
+
+    # 移除 plugin symlinks
+    for plugin in "${PLUGIN_DIRS[@]}"; do
+        target="${HERMES_HOME}/plugins/${plugin}"
+        if [ -L "$target" ]; then
+            rm "$target"
+            echo "REMOVED: plugin ${plugin}"
         fi
     done
 
@@ -70,7 +82,36 @@ install() {
         echo "LINKED: ${f} -> ${source}"
     done
 
-    # 3. 安装 git hook
+    # 3. Symlink plugins
+    mkdir -p "${HERMES_HOME}/plugins"
+    for plugin in "${PLUGIN_DIRS[@]}"; do
+        target="${HERMES_HOME}/plugins/${plugin}"
+        source="${SCRIPT_DIR}/plugins/${plugin}"
+
+        if [ ! -d "$source" ]; then
+            echo "ERROR: plugin directory not found: ${source}"
+            continue
+        fi
+
+        if [ -L "$target" ]; then
+            current_target=$(readlink "$target")
+            if [ "$current_target" = "$source" ]; then
+                echo "SKIP: plugin ${plugin} already symlinked"
+                continue
+            else
+                echo "UPDATE: plugin ${plugin} points to ${current_target}, updating..."
+                rm "$target"
+            fi
+        elif [ -d "$target" ]; then
+            echo "BACKUP: plugin ${plugin} exists as directory, renaming to ${plugin}.bak"
+            mv "$target" "${target}.bak"
+        fi
+
+        ln -s "$source" "$target"
+        echo "LINKED: plugin ${plugin} -> ${source}"
+    done
+
+    # 4. 安装 git hook
     hook_target="${HERMES_AGENT_DIR}/.git/hooks/post-merge"
     hook_source="${SCRIPT_DIR}/hooks/post-merge"
 
